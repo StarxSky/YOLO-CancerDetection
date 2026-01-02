@@ -33,7 +33,20 @@ We have included the appropriate directory structure below. This will allow mode
 |---|---| README.md
 |---|---| trained_model/ ## <-- THIS IS A DIRECTORY FOR SAVING YOUR MODEL. DO NOT FORGET THIS.
 ```
+### Requirments
+```
+torch
+pydicom
+pandas
+numpy
+matplotlib
+opencv-python
+traceback
+tkinter
+skimage
 
+
+```
 ### Downloading and cleaning the data
 The data must be downloaded directly from [Kaggle](https://www.kaggle.com/kmader/crowds-cure-cancer-2017), where you need to create a username and password (if you don't already have one) in order to download the dataset. Once you have downloaded and unzipped the dataset, you will have the raw images and CSV data. We clean the CSV data down to only the necessary information using the `clean_data.py` script in the `label_data/` directory, which produces a new, clean CSV file which is used in the training and example usage usage of the model.
 
@@ -44,6 +57,7 @@ To train the model, one can simply run `$ python model.py` at the command line. 
 To see the results of your saved model, simply run `$ python predict.py`. This is a simple script that loads up the image data, CSV data, and a trained model from the `trained_model/` directory and allows you to visually compare the predicted and ground truth bounding boxes on each image in the dataset.
 
 ## Authors
+* **StarxSky** - [starxsky](https://github.com/starxsky) 
 * **Liam Niehus-Staab** - [niehusst](https://github.com/niehusst)
 * **Eli Salm** - [salmeli](https://github.com/salmeli)
 
