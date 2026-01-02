@@ -49,9 +49,23 @@ skimage
 ```
 ### Downloading and cleaning the data
 The data must be downloaded directly from [Kaggle](https://www.kaggle.com/kmader/crowds-cure-cancer-2017), where you need to create a username and password (if you don't already have one) in order to download the dataset. Once you have downloaded and unzipped the dataset, you will have the raw images and CSV data. We clean the CSV data down to only the necessary information using the `clean_data.py` script in the `label_data/` directory, which produces a new, clean CSV file which is used in the training and example usage usage of the model.
+### New 🆕!!!
+```
+# 基础训练
+python model.py
 
-### Training the model
-To train the model, one can simply run `$ python model.py` at the command line. With the adjustable parameters at the top of the file, you can change some aspects of how the model trains very easily. As the model trains, (assuming you have the Tensorboard variables enabled in `model.py`) it will periodically save logged events to the `logs` directory which can be viewed using Tensorboard. Once the model is trained it will be saved to the `trained_model/` directory (note that this directory must exist prior to the model being saved there, as the write command will fail if the directory is not present). 
+# 自定义参数训练
+python model.py --epochs 10 --batch_size 8 --lr 0.001 --mirror
+
+# 不保存模型，verbose输出
+python model.py --no_save --verbose --epochs 5
+
+# 自定义数据路径
+python model.py --csv_path custom/labels.csv --image_path custom/images/ --weight_path output/model.pth
+```
+
+### Training the model (Original)
+To train the model, one can simply run `$ python model_original.py` at the command line. With the adjustable parameters at the top of the file, you can change some aspects of how the model trains very easily. As the model trains, (assuming you have the Tensorboard variables enabled in `model_original.py`) it will periodically save logged events to the `logs` directory which can be viewed using Tensorboard. Once the model is trained it will be saved to the `trained_model/` directory (note that this directory must exist prior to the model being saved there, as the write command will fail if the directory is not present). 
 
 ### Running a quick test
 To see the results of your saved model, simply run `$ python predict.py`. This is a simple script that loads up the image data, CSV data, and a trained model from the `trained_model/` directory and allows you to visually compare the predicted and ground truth bounding boxes on each image in the dataset.
