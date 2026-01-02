@@ -43,8 +43,8 @@ epsilon = 0.00001
 
 # Learning
 step_size = 0.00001
-BATCH_SIZE = 5
-num_epochs = 1
+BATCH_SIZE = 64
+num_epochs = 100
 
 # Saving
 weight_path = 'trained_model/model_weights.pth'
