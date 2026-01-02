@@ -1,4 +1,6 @@
 # YOLO-Cancer-Detection
+![demo image](https://github.com/StarxSky/YOLO-CancerDetection/blob/main/demo.png?raw=true)
+
 
 An implementation of the YOLO algorithm trained to spot tumors in DICOM images. The model is trained on the "Crowds Cure Cancer" dataset, which only contains images that DO have tumors; this model will always predict a bounding box for a tumor (even if one is not present).
 **NOTE:** Our final model didn't quite work; we hypothesize that the quality of the data may be one of the culprits in our model's inability to learn how to detect the tumors with any accuracy.
