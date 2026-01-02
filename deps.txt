@@ -1,5 +1,5 @@
 #pip install 
-tensorflow
+torch
 tensorboard
 sklearn
 pandas
