@@ -50,8 +50,13 @@ num_epochs = 1
 weight_path = 'trained_model/model_weights.pth'
 
 # Device configuration
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
+if torch.cuda.is_available():
+    device = torch.device('cuda')
+elif torch.backends.mps.is_available():
+    device = torch.device('mps')
+else:
+    device = torch.device('cpu')
+            
 
             
 ###         GET THE DATASET AND PREPROCESS IT        ###
