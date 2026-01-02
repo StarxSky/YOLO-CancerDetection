@@ -339,13 +339,19 @@ def main():
     Main function to run the inference script.
     """
     print("=== YOLO Cancer Detection Inference ===")
-    
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+    elif torch.backends.mps.is_available():
+        device = torch.device('mps')
+    else:
+        device = torch.device('cpu')
     # Load the trained model
     model = load_model(weights_path)
+    #model.to(device)
     
     # Option 1: Predict on all images in CSV file (first 5 images)
     print("\n=== Predicting from CSV file ===")
-    predict_from_csv(model, CSV_PATH, IMAGE_BASE_PATH, num_images=5, save_outputs=True)
+    predict_from_csv(model, CSV_PATH, IMAGE_BASE_PATH, num_images=25, save_outputs=True)
     
     # Option 2: Predict on a single image (uncomment and modify the path)
     # print("\n=== Predicting on single image ===")
