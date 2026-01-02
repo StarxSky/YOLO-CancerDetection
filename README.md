@@ -55,7 +55,8 @@ To train the model, one can simply run `$ python model.py` at the command line. 
 
 ### Running a quick test
 To see the results of your saved model, simply run `$ python predict.py`. This is a simple script that loads up the image data, CSV data, and a trained model from the `trained_model/` directory and allows you to visually compare the predicted and ground truth bounding boxes on each image in the dataset.
-
+### Visualization 
+If you want to see your result, you can find it in `predictions` Folder or you can run `python prediction_visualization.py` (this script has supported the `GUI` and `Jupyter` Environment).
 ## Authors
 * **StarxSky** - [starxsky](https://github.com/starxsky) 
 * **Liam Niehus-Staab** - [niehusst](https://github.com/niehusst)
