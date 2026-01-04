@@ -1,526 +1,343 @@
 #%%writefile model.py
-# Import PyTorch
+# Import PyTorch and related libraries
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
+from torch.utils.tensorboard import SummaryWriter
 
 # Helper libraries
-import math
 import numpy as np
 import pandas as pd
 import pydicom
 import os
-import sys
 import time
-
-# Imports for dataset manipulation
+from tqdm.auto import tqdm
 from sklearn.model_selection import train_test_split
 
-# Improve progress bar display
-import tqdm
-import tqdm.auto
-tqdm.tqdm = tqdm.auto.tqdm
-
-#tf.enable_eager_execution() #comment this out if causing errors
-#tf.logging.set_verbosity(tf.logging.DEBUG)
-
-
+# Device configuration
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
 
 ###             SET MODEL CONFIGURATIONS             ###
 # Data Loading
 CSV_PATH = 'label_data/CCC_clean.csv'
 IMAGE_BASE_PATH = 'data/'
-test_size_percent = 0.15 #percent of total data reserved for testing
+test_size_percent = 0.15
 
-# Data Augmentation
+# Data Augmentation (simple for now; can extend with torchvision.transforms)
 mirror_im = False
 
 # Loss
-lambda_coord = 5
-epsilon = 0.00001
+lambda_coord = 5.0
+epsilon = 1e-5
 
 # Learning
-step_size = 0.00001
-BATCH_SIZE = 64
-num_epochs = 100
+learning_rate = 0.00001
+BATCH_SIZE = 128
+num_epochs = 60
 
 # Saving
-weight_path = 'trained_model/model_weights.pth'
+MODEL_SAVE_PATH = 'trained_model/model_pytorch.pth'
 
-# Device configuration
-if torch.cuda.is_available():
-    device = torch.device('cuda')
-elif torch.backends.mps.is_available():
-    device = torch.device('mps')
-else:
-    device = torch.device('cpu')
-            
+# TensorBoard
+tb_log_dir = f'runs/yolo_cancer_{int(time.time())}'
 
-            
-###         GET THE DATASET AND PREPROCESS IT        ###
 
-print("Loading and processing data\n") 
-
-data_frame = pd.read_csv(CSV_PATH)
-
-"""
-Construct numpy ndarrays from the loaded csv to use as training
-and testing datasets.
-"""
-# zip all points for each image label together into a tuple 
-points = zip(data_frame['start_x'], data_frame['start_y'], \
-                       data_frame['end_x'], data_frame['end_y'])
-img_paths = data_frame['imgPath']
-
-# Custom Dataset class for loading DICOM images and bounding boxes
-class DICOMDataset(Dataset):
-    def __init__(self, img_paths, points, transform=None):
+###         CUSTOM DATASET CLASS         ###
+class CancerDetectionDataset(Dataset):
+    def __init__(self, img_paths, points, base_path=IMAGE_BASE_PATH, augment=False):
         self.img_paths = img_paths
-        self.points = points
-        self.transform = transform
-    
+        self.points = points  # Already normalized [0,1]
+        self.base_path = base_path
+        self.augment = augment
+
     def __len__(self):
         return len(self.img_paths)
-    
+
     def __getitem__(self, idx):
-        # Load image
-        img_path = os.path.join(IMAGE_BASE_PATH, self.img_paths[idx])
-        img = pydicom.dcmread(img_path).pixel_array
-        
-        # Normalize image
-        img = img.astype(np.float32)
-        img += abs(np.amin(img))  # account for negatives
-        img /= np.amax(img)
-        
-        # Get points
-        point = self.points[idx]
-        
-        # Convert to PyTorch tensors
-        img = torch.from_numpy(img).unsqueeze(0)  # Add channel dimension
-        point = torch.from_numpy(point).float()
-        
-        # Apply transformations if any
-        if self.transform:
-            img = self.transform(img)
-        
-        return img, point
+        path = os.path.join(self.base_path, self.img_paths[idx])
+        # Load DICOM
+        image = pydicom.dcmread(path).pixel_array.astype(np.float32)
 
-# normalize the ground truth bounding box labels wrt image dimensions
-def normalize_points(points):
+        # Normalize to [0, 1]
+        image -= image.min()
+        image_min = image.min()
+        if image.max() - image_min > 0:
+            image = (image - image_min) / (image.max() - image_min)
+        
+        # Add channel dimension: (512, 512) -> (1, 512, 512)
+        image = np.expand_dims(image, axis=0)
+
+        # To tensor
+        image = torch.from_numpy(image)  # (1, 512, 512)
+
+        # Target: normalized points [x1, y1, x2, y2] in [0,1]
+        target = torch.tensor(self.points[idx], dtype=torch.float32)
+
+        # Simple augmentation (horizontal flip)
+        if self.augment and mirror_im and torch.rand(1) > 0.5:
+            image = torch.flip(image, dims=[2])  # flip width
+            # Adjust bounding box: x1 <-> x2
+            target = target.clone()
+            target[[0, 2]] = 1.0 - target[[2, 0]]
+
+        return image, target
+
+
+###            MODEL DEFINITION (YOLO-inspired)            ###
+class YOLOCancerDetector(nn.Module):
+    def __init__(self):
+        super(YOLOCancerDetector, self).__init__()
+        
+        self.features = nn.Sequential(
+            # Block 1
+            nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3),  # 512 -> 256
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),                # 256 -> 128
+
+            # Block 2
+            nn.Conv2d(64, 192, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),                # 128 -> 64
+
+            # Block 3
+            nn.Conv2d(192, 128, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),                # 64 -> 32
+
+            # Block 4 (repeated 1x1 -> 3x3 pattern)
+            nn.Conv2d(512, 256, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 256, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 256, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 256, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 1024, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),                # 32 -> 16
+
+            # Block 5
+            nn.Conv2d(1024, 512, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 1024, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(1024, 512, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 1024, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(1024, 1024, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(1024, 1024, kernel_size=3, stride=2, padding=1),  # 16 -> 8
+            nn.ReLU(inplace=True),
+
+            # Final two convs (no pooling)
+            nn.Conv2d(1024, 1024, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(1024, 1024, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+
+        # Now spatial size is 8x8 (1024 channels)
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(1024 * 8 * 8, 1024),   # ← FIXED: 65536 → 1024
+            nn.ReLU(inplace=True),
+            nn.Linear(1024, 4096),
+            nn.ReLU(inplace=True),
+            nn.Linear(4096, 4),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.classifier(x)
+        return x
+
+
+###            CUSTOM LOSS AND METRIC FUNCTIONS            ###
+def iou_metric(y_true, y_pred):
     """
-    Normalize values in points to be within the range of 0 to 1.
-    
-    @param points - list of tuples, each element valued in the range of 0
-                    512 (inclusive). This is known from the nature
-                    of the dataset used in this program
-    @return - list of numpy ndarrays (float), elements valued in range
-              0 to 1 (inclusive)
+    Compute mean IoU between predicted and ground truth boxes.
+    Both: (B, 4) with order [x1, y1, x2, y2] normalized in [0,1]
     """
-    imDims = 512.0  # each image in our dataset is 512x512
-    normalized_points = []
-    from tqdm import tqdm
-    
-    for point in tqdm(list(points)):
-        normalized_point = np.array(point) / imDims
-        normalized_points.append(normalized_point.astype(np.float32))
-    
-    return normalized_points
+    # Ensure correct order: x1 < x2, y1 < y2
+    x1_t = torch.min(y_true[:, 0], y_true[:, 2])
+    y1_t = torch.min(y_true[:, 1], y_true[:, 3])
+    x2_t = torch.max(y_true[:, 0], y_true[:, 2])
+    y2_t = torch.max(y_true[:, 1], y_true[:, 3])
 
-# Prepare transformations
-transform_list = []
-if mirror_im:
-    transform_list.append(transforms.RandomHorizontalFlip(p=1.0))
+    x1_p = torch.min(y_pred[:, 0], y_pred[:, 2])
+    y1_p = torch.min(y_pred[:, 1], y_pred[:, 3])
+    x2_p = torch.max(y_pred[:, 0], y_pred[:, 2])
+    y2_p = torch.max(y_pred[:, 1], y_pred[:, 3])
 
-transform = transforms.Compose(transform_list)
+    # Intersection
+    xi1 = torch.max(x1_t, x1_p)
+    yi1 = torch.max(y1_t, y1_p)
+    xi2 = torch.min(x2_t, x2_p)
+    yi2 = torch.min(y2_t, y2_p)
 
-# Normalize points
-points = normalize_points(points)
+    inter_w = torch.clamp(xi2 - xi1, min=0)
+    inter_h = torch.clamp(yi2 - yi1, min=0)
+    inter_area = inter_w * inter_h
 
-# Convert to numpy arrays
-img_paths = np.array(img_paths)
-points = np.array(points)
+    # Union
+    box_t_area = (x2_t - x1_t) * (y2_t - y1_t)
+    box_p_area = (x2_p - x1_p) * (y2_p - y1_p)
+    union_area = box_t_area + box_p_area - inter_area
 
-# split the data into train and test
-train_img_paths, test_img_paths, train_points, test_points = \
-    train_test_split(img_paths, points, test_size=test_size_percent, random_state=42)
+    iou = inter_area / (union_area + 1e-6)
+    return iou.mean()
 
-# Create datasets
-train_dataset = DICOMDataset(train_img_paths, train_points, transform=transform)
-test_dataset = DICOMDataset(test_img_paths, test_points)
 
-# Create data loaders
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+def yolo_loss(y_pred, y_true, lambda_coord=5.0):
+    """
+    Custom YOLO-style loss focusing on center and size differences.
+    """
+    # Midpoints
+    x_mid_p = y_pred[:, 0] + (y_pred[:, 2] - y_pred[:, 0]) / 2
+    y_mid_p = y_pred[:, 1] + (y_pred[:, 3] - y_pred[:, 1]) / 2
+    x_mid_t = y_true[:, 0] + (y_true[:, 2] - y_true[:, 0]) / 2
+    y_mid_t = y_true[:, 1] + (y_true[:, 3] - y_true[:, 1]) / 2
 
-num_train_examples = len(train_dataset)
-num_test_examples = len(test_dataset)
+    # Widths and heights (using sqrt to penalize small errors less)
+    w_p = torch.sqrt(torch.abs(y_pred[:, 2] - y_pred[:, 0]) + 1e-6)
+    h_p = torch.sqrt(torch.abs(y_pred[:, 3] - y_pred[:, 1]) + 1e-6)
+    w_t = torch.sqrt(torch.abs(y_true[:, 2] - y_true[:, 0]) + 1e-6)
+    h_t = torch.sqrt(torch.abs(y_true[:, 3] - y_true[:, 1]) + 1e-6)
 
+    # Squared differences
+    center_loss = (x_mid_p - x_mid_t)**2 + (y_mid_p - y_mid_t)**2
+    size_loss = (w_p - w_t)**2 + (h_p - h_t)**2
+
+    total_loss = lambda_coord * (center_loss + size_loss)
+    return total_loss.mean()
+
+
+###            DATA PREPARATION            ###
+print("Loading and processing data...")
+data_frame = pd.read_csv(CSV_PATH)
+
+# Normalize points to [0,1]
+im_dims = 512.0
+points = []
+for _, row in data_frame.iterrows():
+    pt = [
+        row['start_x'] / im_dims,
+        row['start_y'] / im_dims,
+        row['end_x'] / im_dims,
+        row['end_y'] / im_dims
+    ]
+    points.append(pt)
+
+points = np.array(points, dtype=np.float32)
+img_paths = data_frame['imgPath'].values
+
+# Train-test split
+train_paths, test_paths, train_points, test_points = train_test_split(
+    img_paths, points, test_size=test_size_percent, random_state=42
+)
+
+train_dataset = CancerDetectionDataset(train_paths, train_points, augment=True)
+test_dataset = CancerDetectionDataset(test_paths, test_points, augment=False)
+
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+
+print(f"Training samples: {len(train_dataset)}, Test samples: {len(test_dataset)}")
 print("Data preprocessing complete\n")
 
 
+###            MODEL, OPTIMIZER, TENSORBOARD            ###
+model = YOLOCancerDetector().to(device)
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+writer = SummaryWriter(log_dir=tb_log_dir)
 
-###            DEFINITION OF MODEL SHAPE             ###
-"""
-Model definition according (approximately) to the YOLO model 
-described by Redmon et al. in "You Only Look Once:
-Unified, Real-Time Object Detection"
-"""
-class YOLOModel(nn.Module):
-    def __init__(self):
-        super(YOLOModel, self).__init__()
-        
-        # Define the convolutional layers
-        self.conv_layers = nn.Sequential(
-            # Layer 1
-            nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            
-            # Layer 2
-            nn.Conv2d(64, 192, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            
-            # Layer 3
-            nn.Conv2d(192, 128, kernel_size=1, stride=1, padding=0),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(256, 256, kernel_size=1, stride=1, padding=0),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(256, 512, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            
-            # Layer 4 (repeat block 4 times)
-            nn.Conv2d(512, 256, kernel_size=1, stride=1, padding=0),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(256, 512, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(512, 256, kernel_size=1, stride=1, padding=0),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(256, 512, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(512, 256, kernel_size=1, stride=1, padding=0),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(256, 512, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(512, 256, kernel_size=1, stride=1, padding=0),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(256, 512, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-            
-            # Layer 5
-            nn.Conv2d(512, 512, kernel_size=1, stride=1, padding=0),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(512, 1024, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            
-            # Layer 6
-            nn.Conv2d(1024, 512, kernel_size=1, stride=1, padding=0),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(512, 1024, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(1024, 512, kernel_size=1, stride=1, padding=0),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(512, 1024, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(1024, 1024, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(1024, 1024, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            
-            # Layer 7
-            nn.Conv2d(1024, 1024, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(1024, 1024, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True)
-        )
-        
-        # Calculate the size after conv layers for the linear layers
-        # For input size 512x512, after all conv and pooling layers, the size will be 4x4
-        # 4x4x1024 = 16384
-        
-        # Define the fully connected layers
-        self.fc_layers = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(1024 * 8 * 8, 1024),  # Corrected input dimension from 4*4 to 8*8
-            nn.Linear(1024, 4096),
-            nn.Linear(4096, 4),
-            nn.Sigmoid()  # 4 outputs: predict 4 points for a bounding box
-        )
-    
-    def forward(self, x):
-        x = self.conv_layers(x)
-        x = self.fc_layers(x)
-        return x
+print("Starting training...\n")
 
-# Create the model
-model = YOLOModel().to(device)
-
-"""
-Our final layer predicts bounding box coordinates. We normalize 
-the bounding box width and height by the image width and height
-so that they fall between 0 and 1.
-
-We use a sigmoid activation function for the final layer to 
-facilitate learning of the normalized range of the output.
-
-All the convolution layers use the rectified linear unit activation.
-"""
-
-# Custom Loss and metric functions
-
-def IOU_metric(y_true, y_pred):
-    """
-    Compute the intersection over the union of the true and
-    the predicted bounding boxes. Output in range 0-1;  
-    1 being the best match of bounding boxes (perfect alignment), 
-    0 being worst (no intersection at all).
-    
-    @param y_true - BATCH_SIZEx4 Tensor object (float), the ground 
-                    truth labels for the bounding boxes around the
-                    tumor in the corresponding images. Value order:
-                    (x_top_left, y_top_left, x_bot_right, y_bot_right)
-    @param y_pred - BATCH_SIZEx4 Tensor object (float), the model's 
-                    prediction for the bounding boxes around the
-                    tumor in the corresponding images. Value order:
-                    (x_top_left, y_top_left, x_bot_right, y_bot_right)
-    @return iou - 1x1 Tensor object (float), value being the mean
-                  IOU for all image in the batch, and is within the 
-                  range of 0-1 (inclusive). 
-    """
-    # extract points from tensors
-    x_LT = torch.min(y_true[:, 0], y_true[:, 2])
-    y_UT = torch.min(y_true[:, 1], y_true[:, 3])
-    x_RT = torch.max(y_true[:, 0], y_true[:, 2])
-    y_LT = torch.max(y_true[:, 1], y_true[:, 3])
-
-    x_LP = torch.min(y_pred[:, 0], y_pred[:, 2])
-    y_UP = torch.min(y_pred[:, 1], y_pred[:, 3])
-    x_RP = torch.max(y_pred[:, 0], y_pred[:, 2])
-    y_LP = torch.max(y_pred[:, 1], y_pred[:, 3])
-
-    # to perform the IOU math correctly, the points that are left-most,
-    # upper-most, right-most, and lower-most must be found
-    xL_pairwise_gt = (x_LT > x_LP).float()
-    yU_pairwise_gt = (y_UT > y_UP).float()
-
-    xW1_pairwise_int = (x_LT < x_RP).float()
-    xW2_pairwise_int = (x_LP < x_RT).float()
-
-    yH1_pairwise_int = (y_UT < y_LP).float()
-    yH2_pairwise_int = (y_UP < y_LT).float()
-
-    # find the amount by which the bboxes intersect
-    x_does_intersect = xL_pairwise_gt * xW1_pairwise_int + (1.0 - xL_pairwise_gt) * xW2_pairwise_int
-    y_does_intersect = yU_pairwise_gt * yH1_pairwise_int + (1.0 - yU_pairwise_gt) * yH2_pairwise_int
-    box_does_intersect = x_does_intersect * y_does_intersect
-
-    a = torch.min(x_RP - x_LT, x_RP - x_LP)
-    b = torch.min(x_RT - x_LP, x_RT - x_LT)
-    c = torch.min(y_LP - y_UT, y_LP - y_UP)
-    d = torch.min(y_LT - y_UP, y_LT - y_UT)
-
-    # calculate intersection area
-    intersection_width = xL_pairwise_gt * a + (1.0 - xL_pairwise_gt) * b
-    intersection_height = yU_pairwise_gt * c + (1.0 - yU_pairwise_gt) * d
-
-    intersection = intersection_width * intersection_height * box_does_intersect
-    
-    # calculate union area
-    area_true = (x_RT - x_LT) * (y_LT - y_UT)
-    area_pred = (x_RP - x_LP) * (y_LP - y_UP)
-    union = area_true + area_pred - intersection
-
-    # take the mean in order to compress BATCH_SIZEx1 Tensor into a 1x1 Tensor
-    iou = torch.mean(intersection / (union + 1e-10))  # Add epsilon to avoid division by zero
-    return iou
-
-def log_loss(y_true, y_pred):
-    """
-    An implementation of the Unitbox negative log loss function proposed
-    by Yu et al. in "Unitbox: an advanced object detection network".
-    This loss function takes advantage of the observation that all the
-    points in a bounding box prediction are highly correlated.
-
-    @param y_true - BATCH_SIZEx4 Tensor object (float), the ground 
-                    truth labels for the bounding boxes around the
-                    tumor in the corresponding images. Value order:
-                    (x_top_left, y_top_left, x_bot_right, y_bot_right)
-    @param y_pred - BATCH_SIZEx4 Tensor object (float), the model's 
-                    prediction for the bounding boxes around the
-                    tumor in the corresponding images. Value order:
-                    (x_top_left, y_top_left, x_bot_right, y_bot_right)
-    @return loss - 1x1 Tensor object (float), valued between 0 and log(epsilon)
-    """
-    iou = IOU_metric(y_true, y_pred)
-    # use epsilon as a replacement for 0 values to prevent NaNs
-    # from appearing in the loss computation
-    iou = torch.where(iou == 0, torch.tensor(epsilon, device=iou.device), iou)
-    # negative log should act as a function that exponentially punishes
-    # boxes that have worse IOU (up to value of log(epsilon))
-    loss = -torch.log(iou)
-    return loss.mean()
-    
-
-# custom loss function using aspects of relevant information from the YOLO paper
-def YOLO_loss(y_true, y_pred):
-    """
-    An implementation of the Unitbox negative log loss function proposed
-    by Yu et al. in "Unitbox: an advanced object detection network".
-    This loss function takes advantage of the observation that all the
-    points in a bounding box prediction are highly correlated.
-    This loss function is very closely related to the mean squared error.
-
-   @param y_true - BATCH_SIZEx4 Tensor object (float), the ground 
-                    truth labels for the bounding boxes around the
-                    tumor in the corresponding images. Value order:
-                    (x_top_left, y_top_left, x_bot_right, y_bot_right)
-    @param y_pred - BATCH_SIZEx4 Tensor object (float), the model's 
-                    prediction for the bounding boxes around the
-                    tumor in the corresponding images. Value order:
-                    (x_top_left, y_top_left, x_bot_right, y_bot_right)
-    @return loss - 1x1 Tensor object (float), value range 0-inf
-    """
-    # extract the vectors of each of the 4 bbox points from each tensor
-    x_LT = y_true[:, 0]
-    y_UT = y_true[:, 1]
-    x_RT = y_true[:, 2]
-    y_LT = y_true[:, 3]
-
-    x_LP = y_pred[:, 0]
-    y_UP = y_pred[:, 1]
-    x_RP = y_pred[:, 2]
-    y_LP = y_pred[:, 3]
-
-    # get the square difference between the midpoints of true and pred bboxs
-    x_Pmid = x_LP + (x_RP - x_LP) / 2
-    x_Tmid = x_LT + (x_RT - x_LT) / 2
-    y_Pmid = y_UP + (y_LP - y_UP) / 2
-    y_Tmid = y_UT + (y_LT - y_UT) / 2
-
-    x_mid_sqdiff = (x_Pmid - x_Tmid) ** 2
-    y_mid_sqdiff = (y_Pmid - y_Tmid) ** 2
-    
-    first_term = x_mid_sqdiff + y_mid_sqdiff
-
-    # get the square difference between the width and height of true and pred bboxs
-    x_Pwidth = torch.sqrt(torch.abs(x_RP - x_LP))
-    x_Twidth = torch.sqrt(torch.abs(x_RT - x_LT))
-    y_Pheight = torch.sqrt(torch.abs(y_UP - y_LP))
-    y_Theight = torch.sqrt(torch.abs(y_UT - y_LT))
-    
-    second_term = (x_Pwidth - x_Twidth) ** 2 + (y_Pheight - y_Theight) ** 2
-
-    # combine the 2 terms using the predefined lambda value (for the coordinate points)
-    # as a weight on the loss
-    loss = (first_term + second_term) * lambda_coord
-    return loss.mean()
-
-
-
-# Define optimizer
-optimizer = optim.Adam(model.parameters(), lr=step_size)
-
-# Optional: Print model summary
-# print(model)
-
-# Create logs directory if it doesn't exist
-if not os.path.exists('logs'):
-    os.makedirs('logs')
-
-###                   TRAIN THE MODEL                ###
-print('Fitting the model\n')
-
-# Training loop
+global_step = 0
 for epoch in range(num_epochs):
-    model.train()  # Set model to training mode
-    running_loss = 0.0
-    running_iou = 0.0
-    running_mse = 0.0
-    
-    from tqdm import tqdm
-    for images, targets in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
-        # Move data to device
-        images = images.to(device)
-        targets = targets.to(device)
-        
-        # Zero the parameter gradients
-        optimizer.zero_grad()
-        
-        # Forward pass
-        outputs = model(images)
-        
-        # Compute loss
-        loss = YOLO_loss(targets, outputs)
-        iou = IOU_metric(targets, outputs)
-        mse = nn.functional.mse_loss(outputs, targets)
-        
-        # Backward pass and optimize
-        loss.backward()
-        optimizer.step()
-        
-        # Update running metrics
-        running_loss += loss.item() * images.size(0)
-        running_iou += iou.item() * images.size(0)
-        running_mse += mse.item() * images.size(0)
-    
-    # Calculate epoch metrics
-    epoch_loss = running_loss / num_train_examples
-    epoch_iou = running_iou / num_train_examples
-    epoch_mse = running_mse / num_train_examples
-    
-    print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {epoch_loss:.4f}, IOU: {epoch_iou:.4f}, MSE: {epoch_mse:.4f}")
+    model.train()
+    epoch_loss = 0.0
+    epoch_iou = 0.0
 
+    with tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}") as pbar:
+        for images, targets in pbar:
+            images = images.to(device)
+            targets = targets.to(device)
 
+            optimizer.zero_grad()
+            outputs = model(images)
 
-###                 EVALUATE THE MODEL               ###
+            loss = yolo_loss(outputs, targets, lambda_coord)
+            loss.backward()
+            optimizer.step()
 
-# evaluate the accuracy of the trained model using the test dataset
-print('Evaluating the model\n')
+            # Metrics
+            with torch.no_grad():
+                iou = iou_metric(targets, outputs)
 
-model.eval()  # Set model to evaluation mode
-with torch.no_grad():
-    test_loss = 0.0
-    test_iou = 0.0
-    test_mse = 0.0
-    
-    for images, targets in test_loader:
-        images = images.to(device)
-        targets = targets.to(device)
-        
-        outputs = model(images)
-        
-        loss = YOLO_loss(targets, outputs)
-        iou = IOU_metric(targets, outputs)
-        mse = nn.functional.mse_loss(outputs, targets)
-        
-        test_loss += loss.item() * images.size(0)
-        test_iou += iou.item() * images.size(0)
-        test_mse += mse.item() * images.size(0)
-    
-    # Calculate test metrics
-    test_loss /= num_test_examples
-    test_iou /= num_test_examples
-    test_mse /= num_test_examples
-    
-    print(f"Test Loss: {test_loss:.4f}, Test IOU: {test_iou:.4f}, Test MSE: {test_mse:.4f}")
+            epoch_loss += loss.item()
+            epoch_iou += iou.item()
+            global_step += 1
 
+            # Update progress bar
+            pbar.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'iou': f'{iou.item():.4f}'
+            })
 
+            # TensorBoard logging
+            writer.add_scalar('train/loss', loss.item(), global_step)
+            writer.add_scalar('train/iou', iou.item(), global_step)
+
+    avg_loss = epoch_loss / len(train_loader)
+    avg_iou = epoch_iou / len(train_loader)
+    print(f"\nEpoch {epoch+1} - Avg Loss: {avg_loss:.4f}, Avg IoU: {avg_iou:.4f}")
+
+    # Validation
+    model.eval()
+    val_loss = 0.0
+    val_iou = 0.0
+    with torch.no_grad():
+        for images, targets in test_loader:
+            images = images.to(device)
+            targets = targets.to(device)
+            outputs = model(images)
+            val_loss += yolo_loss(outputs, targets, lambda_coord).item()
+            val_iou += iou_metric(targets, outputs).item()
+
+    val_loss /= len(test_loader)
+    val_iou /= len(test_loader)
+    print(f"Validation - Loss: {val_loss:.4f}, IoU: {val_iou:.4f}\n")
+
+    writer.add_scalar('val/loss', val_loss, epoch)
+    writer.add_scalar('val/iou', val_iou, epoch)
+
+writer.close()
 
 ###                 SAVING THE MODEL                 ###
-# save the model so that it can be loaded without training later
+torch.save(model.state_dict(), MODEL_SAVE_PATH)
+print(f"Model saved to {MODEL_SAVE_PATH}")
 
-# Create directory if it doesn't exist
-os.makedirs(os.path.dirname(weight_path), exist_ok=True)
-
-# Save only the model weights
-torch.save(model.state_dict(), weight_path)
-print("Saved model weights to disk")
-
-# Optionally save the entire model (architecture + weights)
-# torch.save(model, 'trained_model/entire_model.pth')
+# Optional: save full model
+# torch.save(model, 'trained_model/full_model_pytorch.pt')
