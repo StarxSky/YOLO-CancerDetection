@@ -31,34 +31,87 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 class YOLOCancerDetector(nn.Module):
     def __init__(self):
         super(YOLOCancerDetector, self).__init__()
-        self.backbone = nn.Sequential(
-            nn.Conv2d(1, 32, 3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, 3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(64, 128, 3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(128, 256, 3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(256, 512, 3, padding=1),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((4, 4))
+        
+        self.features = nn.Sequential(
+            # Block 1
+            nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            # Block 2
+            nn.Conv2d(64, 192, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            # Block 3
+            nn.Conv2d(192, 128, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            # Block 4 - repeated 1x1 and 3x3 convolutions
+            nn.Conv2d(512, 256, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 256, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 256, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 256, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 1024, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            # Block 5
+            nn.Conv2d(1024, 512, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 1024, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(1024, 512, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 1024, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(1024, 1024, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(1024, 1024, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+
+            # Final two convolutions
+            nn.Conv2d(1024, 1024, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(1024, 1024, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
         )
-        self.regressor = nn.Sequential(
+
+        # Final feature map: 8x8 x 1024 → flattened = 65536
+        self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(512 * 4 * 4, 512),
-            nn.ReLU(),
-            nn.Linear(512, 4),   # outputs [x1, y1, x2, y2] normalized in [0,1]
-            nn.Sigmoid()        # ensures output in [0,1]
+            nn.Linear(1024 * 8 * 8, 1024),
+            nn.ReLU(inplace=True),
+            nn.Linear(1024, 4096),
+            nn.ReLU(inplace=True),
+            nn.Linear(4096, 4),
+            nn.Sigmoid()  # Output normalized [0,1] bounding box coordinates
         )
 
     def forward(self, x):
-        x = self.backbone(x)
-        x = self.regressor(x)
+        x = self.features(x)
+        x = self.classifier(x)
         return x
 
 
