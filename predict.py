@@ -193,47 +193,44 @@ def main():
 
     print(f"Processing {len(data_frame)} images...")
 
-    with torch.no_grad():  # No gradients needed for inference
-        for i in range(len(data_frame['imgPath'])):
-            img_path = os.path.join(IMAGE_BASE_PATH, data_frame['imgPath'][i])
-            img = load_image(img_path)
+    with torch.no_grad():
+        output = model(input_tensor)  # (1, 4)
 
-            # Preprocess and predict
-            input_tensor = pre_process(img)
-            output = model(input_tensor)  # shape: (1, 4)
-            
-            # Convert normalized coordinates back to pixel values
-            points = (output.cpu().numpy()[0] * img_dims).astype(np.int32)
-            pred_bbox = [points[0], points[1], points[2], points[3]]  # [x1, y1, x2, y2]
+        # Predicted box
+        pred = output.cpu().numpy()[0] * img_dims
+        x1, y1, x2, y2 = pred
+        x0 = int(max(0, min(x1, x2)))
+        y0 = int(max(0, min(y1, y2)))
+        x1 = int(min(img_dims - 1, max(x1, x2)))
+        y1 = int(min(img_dims - 1, max(y1, y2)))
+        pred_bbox = [x0, y0, x1, y1]
+        # Ground truth box (safe)
+        gt_x1 = int(data_frame['start_x'][i])
+        gt_y1 = int(data_frame['start_y'][i])
+        gt_x2 = int(data_frame['end_x'][i])
+        gt_y2 = int(data_frame['end_y'][i])
+        true_bbox = [
+            max(0, min(gt_x1, gt_x2)),
+            max(0, min(gt_y1, gt_y2)),
+            min(img_dims - 1, max(gt_x1, gt_x2)),
+            min(img_dims - 1, max(gt_y1, gt_y2))
+        ]
 
-            # Ground truth bbox
-            true_bbox = [
-                int(data_frame['start_x'][i]),
-                int(data_frame['start_y'][i]),
-                int(data_frame['end_x'][i]),
-                int(data_frame['end_y'][i])
-            ]
+        # Draw
+        draw.rectangle(pred_bbox, outline="#ff0000", width=4)
+        draw.rectangle(true_bbox, outline="#00ff00", width=4)
+        # Labels
+        draw.text((pred_bbox[0], pred_bbox[1] - 20), "Predicted", fill="#ff0000")
+        draw.text((true_bbox[0], true_bbox[1] - 20), "Ground Truth", fill="#00ff00")
+    
+    
 
-            # Prepare image for display
-            display_img = normalize_image(img)
-            pil_img = Image.fromarray(display_img).convert("RGB")
-            draw = ImageDraw.Draw(pil_img)
+        pil_img.show()
+        print(f"Displayed image {i+1}/{len(data_frame)}: {data_frame['imgPath'][i]}")
+        time.sleep(1)  # Give user time to view/close
 
-            # Draw predicted box (red)
-            draw.rectangle(pred_bbox, outline="#ff0000", width=3)
-            # Draw ground truth box (green)
-            draw.rectangle(true_bbox, outline="#00ff00", width=3)
-
-            # Optional: add labels
-            draw.text((pred_bbox[0], pred_bbox[1] - 10), "Pred", fill="#ff0000")
-            draw.text((true_bbox[0], true_bbox[1] - 10), "True", fill="#00ff00")
-
-            pil_img.show()
-            print(f"Displayed image {i+1}/{len(data_frame)}: {data_frame['imgPath'][i]}")
-            time.sleep(1)  # Give user time to view/close
-
-            # Optional: break early for testing
-            # if i >= 9: break
+        # Optional: break early for testing
+        # if i >= 9: break
 
 
 if __name__ == '__main__':
